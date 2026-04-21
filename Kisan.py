@@ -1,6 +1,7 @@
 import os
 import re
 import io
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -51,6 +52,9 @@ DEFAULTS = {
     "weather_bump": 0,
     "s_season_filter": "All",
     "s_district_filter": "All",
+    "s_market_filter": "All",
+    "market_data_status": "cached",
+    "market_data_last_updated": "",
 }
 # Initialize session state with defaults
 for k, v in DEFAULTS.items():
@@ -96,6 +100,7 @@ T = {
     "soil_ph":          {"English": "Your Soil pH", "मराठी": "आपल्या मातीचा pH"},
     "water_src":        {"English": "Water Source", "मराठी": "पाण्याचा स्रोत"},
     "district":         {"English": "District", "मराठी": "जिल्हा"},
+    "market_filter":    {"English": "Market", "मराठी": "बाजार"},
     "get_rec":          {"English": "🔍 Get Full Crop Recommendation", "मराठी": "🔍 संपूर्ण पिक शिफारस मिळवा"},
    
     "maint_header":     {"English": "🩺 Crop Health Centre", "मराठी": "🩺 पिक आरोग्य केंद्र"},
@@ -208,6 +213,12 @@ T = {
     "analysing_mkt":    {"English": "Analysing…", "मराठी": "विश्लेषण होत आहे…"},
     "ask_grower":       {"English": "AI Agronomist — soil, crops, farming practices:", "मराठी": "AI कृषितज्ञ — माती, पिके, शेती पद्धती:"},
     "no_data_filter":   {"English": "No data for selected filters.", "मराठी": "निवडलेल्या फिल्टरसाठी डेटा नाही."},
+    "data_status_live": {"English": "Live data", "मराठी": "थेट डेटा"},
+    "data_status_cached": {"English": "Offline/Cached", "मराठी": "ऑफलाइन/कॅश"},
+    "market_last_updated": {"English": "Last updated", "मराठी": "शेवटचे अद्यतन"},
+    "offline_market_note": {"English": "Live mandi service is unavailable right now. Showing trusted cached baseline data.", "मराठी": "थेट मंडी सेवा सध्या उपलब्ध नाही. विश्वसनीय कॅश केलेला आधारभूत डेटा दाखवत आहोत."},
+    "no_data_combo": {"English": "No mandi records match this filter combination. Try a nearby district, season, or market.", "मराठी": "या फिल्टर संयोजनासाठी मंडी नोंदी उपलब्ध नाहीत. जवळचा जिल्हा, हंगाम किंवा बाजार निवडा."},
+    "grow_safety_title": {"English": "Safety note before recommendation", "मराठी": "शिफारशीपूर्वी सुरक्षा सूचना"},
 }
 
 def t(key):
@@ -552,7 +563,50 @@ def fetch_live_mandi_maharashtra() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=86400)
+def _market_fetch_status(live_df: pd.DataFrame) -> tuple[str, str]:
+    ts = datetime.now().strftime("%d %b %Y, %H:%M")
+    if live_df is not None and not live_df.empty:
+        return "live", ts
+    return "cached", ts
+
+
+def _apply_market_filters(df: pd.DataFrame, crop: str, season: str, district: str, market: str) -> pd.DataFrame:
+    expr = "Crop == @crop"
+    if season != "All":
+        expr += " and Season == @season"
+    if district != "All":
+        expr += " and District == @district"
+    if market != "All":
+        expr += " and Market == @market"
+    return df.query(expr).copy()
+
+
+def _market_safety_warning(soil_type: str, season: str, district: str, water: str) -> str:
+    district_l = district.lower()
+    water_l = water.lower()
+    soil_l = soil_type.lower()
+    season_l = season.lower()
+    drought_hotspots = {"beed", "osmanabad", "latur", "jalna", "parbhani", "nanded"}
+    rainfed_terms = ("rain-fed", "पावसावर")
+    low_water_terms = ("borewell", "बोअरवेल")
+    dry_season = ("zaid", "उन्हाळी")
+
+    if district_l in drought_hotspots and any(x in water_l for x in rainfed_terms + low_water_terms):
+        return (
+            "Water stress risk is high for this location-source combination. Prefer drought-tolerant crops, "
+            "mulching, and short-duration varieties; avoid water-intensive plans unless assured irrigation exists."
+        )
+    if any(x in season_l for x in dry_season) and any(x in water_l for x in rainfed_terms):
+        return (
+            "Summer/rain-fed combination has high irrigation risk. Plan only low-water crops with staggered sowing "
+            "and moisture conservation."
+        )
+    if "saline" in soil_l and any(x in season_l for x in dry_season):
+        return "Salinity stress can rise in summer. Prioritize salt-tolerant crops and leaching/organic-matter management."
+    return ""
+
+
+@st.cache_data(ttl=43200)
 def load_data():
     base = pd.read_csv(io.StringIO(PRICE_CSV))
     try:
@@ -569,14 +623,19 @@ def load_data():
             price = base
     else:
         price = base
+    status, updated_at = _market_fetch_status(live)
     return (
         price,
         pd.read_csv(io.StringIO(SOIL_CSV)),
         pd.read_csv(io.StringIO(MSP_CSV)),
+        status,
+        updated_at,
     )
 
 
-price_df, soil_df, msp_df = load_data()
+price_df, soil_df, msp_df, market_data_status, market_data_last_updated = load_data()
+st.session_state.market_data_status = market_data_status
+st.session_state.market_data_last_updated = market_data_last_updated
 
 
 MH_DISTRICT_LATLON = {
@@ -1088,7 +1147,9 @@ def ask_gemini(prompt, context="", data_context="", use_rag=True, extra_knowledg
         f"{'Use fluent, correct Marathi with proper grammar and Devanagari script. Minimize unnecessary English.' if IS_MR else ''} "
         f"Be specific, data-driven, and farmer-friendly. Use bullet points, concrete numbers, and local context. "
         f"Mention relevant government schemes, APMC / e-NAM where relevant, and seasonal timing for Maharashtra. "
-        f"If portal excerpts conflict with structured data, note the discrepancy and prefer official mandi/department figures when available."
+        f"If portal excerpts conflict with structured data, note the discrepancy and prefer official mandi/department figures when available. "
+        f"GROUNDING RULE: Base recommendations on the provided structured/tabular context first (ICAR soil / Agmarknet / MSP / KVK references). "
+        f"Do not invent figures not present in the provided context; if data is missing, clearly say so and give safe generic guidance."
     )
     full_prompt = f"{system}\n\nQuestion: {prompt}"
 
@@ -2442,6 +2503,9 @@ elif st.session_state.page == "growing":
             }
             water = st.selectbox(t("water_src"), water_opts[st.session_state.lang])
             district = st.selectbox(t("district"), sorted(price_df["District"].unique()), key="g_district")
+        safety_note = _market_safety_warning(soil_en, season, district, water)
+        if safety_note:
+            st.warning(f"⚠️ {t('grow_safety_title')}: {safety_note}")
 
         soil_row = soil_df[soil_df["Soil_Type"] == soil_en].iloc[0]
         soil_mr_name = soil_row["Soil_MR"]
@@ -2493,17 +2557,26 @@ elif st.session_state.page == "growing":
                         f"Fe {soil_row['Fe_ppm']} ppm, Zn {soil_row['Zn_ppm']} ppm. "
                         f"Primary crops: {soil_row['Primary_Crops']}. Deficiencies: {soil_row['Deficiencies']}. "
                         f"Standard amendment: {soil_row['Amendment']}.")
+            user_filter_ctx = (
+                f"Farmer profile (must be applied strictly): District={district}; Season={season}; "
+                f"Soil Type={soil_en}; Soil pH={ph}; Water Source={water}."
+            )
             prompt = (f"For {soil_en} soil at measured pH {ph} in {district}, Maharashtra, season {season}, water: {water}. "
                       f"Answer as a complete planting guide: (1) soil pH interpretation and correction if needed; "
                       f"(2) soil texture & drainage implications; (3) exhaustive list of suitable crops for this zone with named varieties "
                       f"(cereals, pulses, oilseeds, fibre, cash crops, vegetables, spices — as many as realistically grown in Maharashtra); "
                       f"(4) top 5 priority crops for this farmer with seed rate, sowing window, spacing; "
                       f"(5) full NPK + micronutrient plan; (6) organic options; (7) schemes: PM-KISAN, Soil Health Card, RKVY, state advisories.")
+            if safety_note:
+                prompt = f"Safety note: {safety_note}\n\n{prompt}"
             with st.spinner(t("analysing")):
                 result = ask_gemini(
                     prompt,
-                    context="You specialise in agronomy and soil–crop matching for Maharashtra.",
-                    data_context=data_ctx,
+                    context=(
+                        "You specialise in agronomy and soil–crop matching for Maharashtra. "
+                        "Treat the provided farmer profile as mandatory constraints and tailor every recommendation to it."
+                    ),
+                    data_context=f"{user_filter_ctx}\n{data_ctx}",
                     extra_knowledge=CROP_VARIETY_REFERENCE,
                 )
             st.markdown(f'<div class="resp-box">{result}</div>', unsafe_allow_html=True)
@@ -2578,9 +2651,19 @@ elif st.session_state.page == "growing":
             st.session_state.grow_msgs.append({"role": "user", "content": user_in})
             with st.spinner(t("chip_working")):
                 try:
+                    _chat_safety = _market_safety_warning(soil_en, season, district, water)
+                    _chat_ctx = (
+                        f"Farmer profile constraints: Soil={soil_en}; pH={ph}; District={district}; "
+                        f"Season={season}; Water Source={water}."
+                    )
+                    _chat_prompt = user_in if not _chat_safety else f"Safety note: {_chat_safety}\n\nQuestion: {user_in}"
                     r = ask_gemini(
-                        user_in,
-                        context="You specialise in crop science and soil chemistry for Maharashtra.",
+                        _chat_prompt,
+                        context=(
+                            "You specialise in crop science and soil chemistry for Maharashtra. "
+                            "Answer strictly for the farmer profile constraints from the current UI filters."
+                        ),
+                        data_context=_chat_ctx,
                         extra_knowledge=CROP_VARIETY_REFERENCE,
                     )
                 except Exception as _ex:
@@ -2754,7 +2837,8 @@ elif st.session_state.page == "selling":
             crop_sel_d = st.selectbox(t("crop_lbl"), crop_disp, key="s_crop")
             crop_sel = crops_avail[crop_disp.index(crop_sel_d)]
         with c_f2:
-            season_values = ["All"] + list(price_df["Season"].unique())
+            base_crop = _apply_market_filters(price_df, crop_sel, "All", "All", "All")
+            season_values = ["All"] + sorted(base_crop["Season"].dropna().unique().tolist())
             season_labels = {
                 "All": "All / सर्व" if IS_MR else "All",
                 "Kharif": "खरीप" if IS_MR else "Kharif",
@@ -2774,7 +2858,8 @@ elif st.session_state.page == "selling":
             )
             st.session_state.s_season_filter = season_sel
         with c_f3:
-            dist_values = ["All"] + sorted(price_df["District"].unique())
+            crop_season = _apply_market_filters(price_df, crop_sel, season_sel, "All", "All")
+            dist_values = ["All"] + sorted(crop_season["District"].dropna().unique().tolist())
             if st.session_state.s_district_filter not in dist_values:
                 st.session_state.s_district_filter = "All"
             _d_idx = dist_values.index(st.session_state.s_district_filter)
@@ -2787,13 +2872,29 @@ elif st.session_state.page == "selling":
             )
             st.session_state.s_district_filter = dist_sel
 
-        st.caption(t("live_prices_note"))
+        crop_season_dist = _apply_market_filters(price_df, crop_sel, season_sel, dist_sel, "All")
+        market_values = ["All"] + sorted(crop_season_dist["Market"].dropna().unique().tolist())
+        if st.session_state.s_market_filter not in market_values:
+            st.session_state.s_market_filter = "All"
+        with st.container():
+            market_sel = st.selectbox(
+                t("market_filter"),
+                market_values,
+                index=market_values.index(st.session_state.s_market_filter),
+                key="s_market_filter_ui",
+                format_func=lambda m: ("सर्व बाजार" if IS_MR and m == "All" else m),
+            )
+        st.session_state.s_market_filter = market_sel
 
-        filt = price_df[price_df["Crop"] == crop_sel].copy()
-        if season_sel != "All":
-            filt = filt[filt["Season"] == season_sel]
-        if dist_sel != "All":
-            filt = filt[filt["District"] == dist_sel]
+        status_label = t("data_status_live") if st.session_state.market_data_status == "live" else t("data_status_cached")
+        st.caption(
+            f"{t('live_prices_note')} · {t('data_src_lbl')}: {status_label} · "
+            f"{t('market_last_updated')}: {st.session_state.market_data_last_updated}"
+        )
+        if st.session_state.market_data_status != "live":
+            st.info(t("offline_market_note"))
+
+        filt = _apply_market_filters(price_df, crop_sel, season_sel, dist_sel, market_sel)
 
         if not filt.empty:
             best = filt.loc[filt["Modal_Price"].idxmax()]
@@ -2879,7 +2980,7 @@ elif st.session_state.page == "selling":
                 f"{t('source_label')}: DMI · [Agmarknet](https://agmarknet.gov.in) · data.gov.in"
             )
         else:
-            st.info(t("no_data_filter"))
+            st.info(t("no_data_combo"))
 
         _price_ctx = ""
         if not filt.empty:
